@@ -1,3 +1,4 @@
+
 from this import d
 import gradio as gr
 import numpy as np
@@ -7,7 +8,10 @@ import copy
 import os
 import random
 import datetime
-from PIL import ImageFont
+import json
+from base64 import b64decode
+from io import BytesIO
+from PIL import Image, ImageFont
 from utils.gradio_utils import (
     character_to_dict,
     process_original_prompt,
@@ -16,6 +20,8 @@ from utils.gradio_utils import (
     cal_attn_indice_xl_effcient_memory,
     is_torch2_available,
 )
+import base64
+import cv2
 
 if is_torch2_available():
     from utils.gradio_utils import AttnProcessor2_0 as AttnProcessor
@@ -26,6 +32,7 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import
     StableDiffusionXLPipeline,
 )
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline
 import torch.nn.functional as F
 from diffusers.utils.loading_utils import load_image
 from utils.utils import get_comic
@@ -38,6 +45,8 @@ global models_dict
 
 models_dict = get_models_dict()
 
+controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-canny", torch_dtype=torch.float16)
+
 # Automatically select the device
 device = (
     "cuda"
@@ -46,6 +55,23 @@ device = (
 )
 print(f"@@device:{device}")
 
+
+def parse_prompt_json(json_string):
+    try:
+        data = json.loads(json_string)
+        prompts = {}
+        control_images = {}
+        for key, item in data.items():
+            prompts[key] = item['prompt']
+            if 'control_image' in item:
+                img_data = b64decode(item['control_image'])
+                img = Image.open(BytesIO(img_data))
+                control_images[key] = img
+        return prompts, control_images
+    except json.JSONDecodeError:
+        raise gr.Error("Invalid JSON format in prompt array.")
+    except KeyError:
+        raise gr.Error("Each item in the JSON must have a 'prompt' key.")
 
 # check if the file exists locally at a specified path before downloading it.
 # if the file doesn't exist, it uses `hf_hub_download` to download the file
@@ -577,7 +603,7 @@ if single_files:
     )
 else:
     pipe = StableDiffusionXLPipeline.from_pretrained(
-        sd_model_path, torch_dtype=torch.float16, use_safetensors=False
+        sd_model_path, torch_dtype=torch.float16, use_safetensors=False, controlnet=controlnet,
     )
 pipe = pipe.to(device)
 pipe.enable_freeu(s1=0.6, s2=0.4, b1=1.1, b2=1.2)
@@ -700,28 +726,29 @@ def load_character_files_on_running(unet, character_files: str):
 
 
 ######### Image Generation ##############
+
 def process_generation(
-    _sd_type,
-    _model_type,
-    _upload_images,
-    _num_steps,
-    style_name,
-    _Ip_Adapter_Strength,
-    _style_strength_ratio,
-    guidance_scale,
-    seed_,
-    sa32_,
-    sa64_,
-    id_length_,
-    general_prompt,
-    negative_prompt,
-    prompt_array,
-    G_height,
-    G_width,
-    _comic_type,
-    font_choice,
-    _char_files,
-):  # Corrected font_choice usage
+        _sd_type,
+        _model_type,
+        _upload_images,
+        _num_steps,
+        style_name,
+        _Ip_Adapter_Strength,
+        _style_strength_ratio,
+        guidance_scale,
+        seed_,
+        sa32_,
+        sa64_,
+        id_length_,
+        general_prompt,
+        negative_prompt,
+        prompt_json,
+        G_height,
+        G_width,
+        _comic_type,
+        font_choice,
+        _char_files,
+):
     if len(general_prompt.splitlines()) >= 3:
         raise gr.Error(
             "Support for more than three characters is temporarily unavailable due to VRAM limitations, but this issue will be resolved soon."
@@ -729,10 +756,11 @@ def process_generation(
     _model_type = "Photomaker" if _model_type == "Using Ref Images" else "original"
     if _model_type == "Photomaker" and "img" not in general_prompt:
         raise gr.Error(
-            'Please add the triger word " img "  behind the class word you want to customize, such as: man img or woman img'
+            'Please add the trigger word " img " behind the class word you want to customize, such as: man img or woman img'
         )
     if _upload_images is None and _model_type != "original":
         raise gr.Error(f"Cannot find any input face image!")
+
     global sa32, sa64, id_length, total_length, attn_procs, unet, cur_model_type
     global write
     global cur_step, attn_count
@@ -741,20 +769,34 @@ def process_generation(
     width = G_width
     global pipe
     global sd_model_path, models_dict
-    sd_model_path = models_dict[_sd_type]
+
+    if not hasattr(pipe, 'controlnet'):
+        controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-canny", torch_dtype=torch.float16).to(device)
+        pipe.controlnet = controlnet
+
+    # Parse the JSON input
+    prompts_dict, control_images_dict = parse_prompt_json(prompt_json)
+    prompts = [prompts_dict[str(i)] for i in range(len(prompts_dict))]
+
+    # Process control images
+    processed_control_images = {}
+    for key, image in control_images_dict.items():
+        if image:
+            processed_control_images[key] = prepare_canny_image(image)
+
+    sd_model_path = models_dict[_sd_type]["path"]
     use_safe_tensor = True
     for attn_processor in pipe.unet.attn_processors.values():
         if isinstance(attn_processor, SpatialAttnProcessor2_0):
             for values in attn_processor.id_bank.values():
                 del values
             attn_processor.id_bank = {}
-            attn_processor.id_length = id_length
-            attn_processor.total_length = id_length + 1
+            attn_processor.id_length = id_length_
+            attn_processor.total_length = id_length_ + 1
     gc.collect()
     torch.cuda.empty_cache()
+
     if cur_model_type != _sd_type + "-" + _model_type:
-        # apply the style template
-        ##### load pipe
         del pipe
         gc.collect()
         if device == "cuda":
@@ -763,7 +805,6 @@ def process_generation(
         model_info["model_type"] = _model_type
         pipe = load_models(model_info, device=device, photomaker_path=photomaker_path)
         set_attention_processor(pipe.unet, id_length_, is_ipadapter=False)
-        ##### ########################
         pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
         pipe.enable_freeu(s1=0.6, s2=0.4, b1=1.1, b2=1.2)
         cur_model_type = _sd_type + "-" + _model_type
@@ -772,40 +813,25 @@ def process_generation(
             pipe.enable_model_cpu_offload()
     else:
         unet = pipe.unet
-        # unet.set_attn_processor(copy.deepcopy(attn_procs))
 
     load_chars = load_character_files_on_running(unet, character_files=_char_files)
 
-    prompts = prompt_array.splitlines()
     global character_dict, character_index_dict, invert_character_index_dict, ref_indexs_dict, ref_totals
     character_dict, character_list = character_to_dict(general_prompt)
 
-    start_merge_step = int(float(_style_strength_ratio) / 100 * _num_steps)
-    if start_merge_step > 30:
-        start_merge_step = 30
+    start_merge_step = min(int(float(_style_strength_ratio) / 100 * _num_steps), 30)
     print(f"start_merge_step:{start_merge_step}")
     generator = torch.Generator(device=device).manual_seed(seed_)
     sa32, sa64 = sa32_, sa64_
     id_length = id_length_
-    clipped_prompts = prompts[:]
-    nc_indexs = []
-    for ind, prompt in enumerate(clipped_prompts):
-        if "[NC]" in prompt:
-            nc_indexs.append(ind)
-            if ind < id_length:
-                raise gr.Error(
-                    f"The first {id_length} row is id prompts, cannot use [NC]!"
-                )
-    prompts = [
-        prompt if "[NC]" not in prompt else prompt.replace("[NC]", "")
-        for prompt in clipped_prompts
-    ]
 
-    prompts = [
-        prompt.rpartition("#")[0] if "#" in prompt else prompt for prompt in prompts
-    ]
-    print(prompts)
-    # id_prompts = prompts[:id_length]
+    nc_indexs = [i for i, prompt in enumerate(prompts) if "[NC]" in prompt]
+    for ind in nc_indexs:
+        if ind < id_length:
+            raise gr.Error(f"The first {id_length} rows are id prompts, cannot use [NC]!")
+    prompts = [prompt.replace("[NC]", "") for prompt in prompts]
+    prompts = [prompt.split("#")[0] for prompt in prompts]
+
     (
         character_index_dict,
         invert_character_index_dict,
@@ -813,31 +839,31 @@ def process_generation(
         ref_indexs_dict,
         ref_totals,
     ) = process_original_prompt(character_dict, prompts.copy(), id_length)
+
     if _model_type != "original":
         input_id_images_dict = {}
         if len(_upload_images) != len(character_dict.keys()):
             raise gr.Error(
-                f"You upload images({len(_upload_images)}) is not equal to the number of characters({len(character_dict.keys())})!"
+                f"You uploaded {len(_upload_images)} images, but there are {len(character_dict.keys())} characters!"
             )
         for ind, img in enumerate(_upload_images):
             input_id_images_dict[character_list[ind]] = [load_image(img)]
+
     print(character_dict)
     print(character_index_dict)
     print(invert_character_index_dict)
-    # real_prompts = prompts[id_length:]
+
     if device == "cuda":
         torch.cuda.empty_cache()
     write = True
     cur_step = 0
-
     attn_count = 0
-    # id_prompts, negative_prompt = apply_style(style_name, id_prompts, negative_prompt)
-    # print(id_prompts)
     setup_seed(seed_)
     total_results = []
     id_images = []
     results_dict = {}
     global cur_character
+
     if not load_chars:
         for character_key in character_dict.keys():
             cur_character = [character_key]
@@ -851,9 +877,14 @@ def process_generation(
             cur_positive_prompts, negative_prompt = apply_style(
                 style_name, current_prompts, negative_prompt
             )
+            control_images = [processed_control_images.get(str(i)) for i in ref_indexs]
+            # control_images = [control_images_dict.get(str(i)) for i in ref_indexs]
+            # control_images = [prepare_canny_image(img) if img else None for img in control_images]
+
             if _model_type == "original":
                 id_images = pipe(
                     cur_positive_prompts,
+                    image=control_images,
                     num_inference_steps=_num_steps,
                     guidance_scale=guidance_scale,
                     height=height,
@@ -864,6 +895,7 @@ def process_generation(
             elif _model_type == "Photomaker":
                 id_images = pipe(
                     cur_positive_prompts,
+                    image=control_images,
                     input_id_images=input_id_images_dict[character_key],
                     num_inference_steps=_num_steps,
                     guidance_scale=guidance_scale,
@@ -875,25 +907,15 @@ def process_generation(
                 ).images
             else:
                 raise NotImplementedError(
-                    "You should choice between original and Photomaker!",
-                    f"But you choice {_model_type}",
+                    f"You should choose between original and Photomaker! But you chose {_model_type}"
                 )
 
-            # total_results = id_images + total_results
-            # yield total_results
-            print(id_images)
             for ind, img in enumerate(id_images):
-                print(ref_indexs[ind])
                 results_dict[ref_indexs[ind]] = img
-            # real_images = []
-            yield [results_dict[ind] for ind in results_dict.keys()]
+            yield [results_dict[ind] for ind in sorted(results_dict.keys())]
+
     write = False
-    if not load_chars:
-        real_prompts_inds = [
-            ind for ind in range(len(prompts)) if ind not in ref_totals
-        ]
-    else:
-        real_prompts_inds = [ind for ind in range(len(prompts))]
+    real_prompts_inds = range(len(prompts)) if load_chars else [i for i in range(len(prompts)) if i not in ref_totals]
     print(real_prompts_inds)
 
     for real_prompts_ind in real_prompts_inds:
@@ -902,15 +924,21 @@ def process_generation(
         print(cur_character, real_prompt)
         setup_seed(seed_)
         if len(cur_character) > 1 and _model_type == "Photomaker":
-            raise gr.Error(
-                "Temporarily Not Support Multiple character in Ref Image Mode!"
-            )
+            raise gr.Error("Temporarily Not Supporting Multiple characters in Ref Image Mode!")
         generator = torch.Generator(device=device).manual_seed(seed_)
         cur_step = 0
         real_prompt = apply_style_positive(style_name, real_prompt)
+
+        control_image = control_images_dict.get(str(real_prompts_ind))
+        print("control_image")
+        print(control_image)
+        if control_image:
+            control_image = prepare_canny_image(control_image)
+
         if _model_type == "original":
             results_dict[real_prompts_ind] = pipe(
                 real_prompt,
+                image=control_image,
                 num_inference_steps=_num_steps,
                 guidance_scale=guidance_scale,
                 height=height,
@@ -921,6 +949,7 @@ def process_generation(
         elif _model_type == "Photomaker":
             results_dict[real_prompts_ind] = pipe(
                 real_prompt,
+                image=control_image,
                 input_id_images=(
                     input_id_images_dict[cur_character[0]]
                     if real_prompts_ind not in nc_indexs
@@ -933,33 +962,33 @@ def process_generation(
                 width=width,
                 negative_prompt=negative_prompt,
                 generator=generator,
-                nc_flag=True if real_prompts_ind in nc_indexs else False,
+                nc_flag=real_prompts_ind in nc_indexs,
             ).images[0]
         else:
             raise NotImplementedError(
-                "You should choice between original and Photomaker!",
-                f"But you choice {_model_type}",
+                f"You should choose between original and Photomaker! But you chose {_model_type}"
             )
-        yield [results_dict[ind] for ind in results_dict.keys()]
+        yield [results_dict[ind] for ind in sorted(results_dict.keys())]
+
     total_results = [results_dict[ind] for ind in range(len(prompts))]
     if _comic_type != "No typesetting (default)":
-        captions = prompt_array.splitlines()
+        captions = [prompts_dict[str(i)].split("#")[-1] if "#" in prompts_dict[str(i)] else prompts_dict[str(i)] for i
+                    in range(len(prompts_dict))]
         captions = [caption.replace("[NC]", "") for caption in captions]
-        captions = [
-            caption.split("#")[-1] if "#" in caption else caption
-            for caption in captions
-        ]
         font_path = os.path.join("fonts", font_choice)
         font = ImageFont.truetype(font_path, int(45))
-        total_results = (
-            get_comic(total_results, _comic_type, captions=captions, font=font)
-            + total_results
-        )
-    save_results(pipe.unet, total_results)
+        total_results = get_comic(total_results, _comic_type, captions=captions, font=font) + total_results
 
+    save_results(pipe.unet, total_results)
     yield total_results
 
 
+def prepare_canny_image(image):
+    image = np.array(image)
+    image = cv2.Canny(image, 100, 200)
+    image = image[:, :, None]
+    image = np.concatenate([image, image, image], axis=2)
+    return Image.fromarray(image)
 def array2string(arr):
     stringtmp = ""
     for i, part in enumerate(arr):
@@ -979,13 +1008,11 @@ with gr.Blocks(css=css) as demo:
     binary_matrixes = gr.State([])
     color_layout = gr.State([])
 
-    # gr.Markdown(logo)
     gr.Markdown(title)
     gr.Markdown(description)
 
     with gr.Row():
         with gr.Group(elem_id="main-image"):
-
             prompts = []
             colors = []
 
@@ -1034,11 +1061,17 @@ with gr.Blocks(css=css) as demo:
                     choices=STYLE_NAMES,
                     value=DEFAULT_STYLE_NAME,
                 )
-                prompt_array = gr.Textbox(
-                    lines=3,
+                prompt_json = gr.Textbox(
+                    lines=10,
                     value="",
-                    label="(3) Comic Description (each line corresponds to a frame).",
+                    label="(3) Comic Description (JSON format with optional ControlNet images)",
+                    info="Each entry should have 'prompt' and optionally 'control_image' keys.",
                     interactive=True,
+                )
+                control_images = gr.Files(
+                    label="(Optional) Control Images for ControlNet",
+                    file_types=["image"],
+                    file_count="multiple",
                 )
                 char_path = gr.Textbox(
                     lines=2,
@@ -1182,7 +1215,7 @@ with gr.Blocks(css=css) as demo:
             id_length_,
             general_prompt,
             negative_prompt,
-            prompt_array,
+            prompt_json,
             G_height,
             G_width,
             comic_type,
@@ -1191,6 +1224,19 @@ with gr.Blocks(css=css) as demo:
         ],
         outputs=out_image,
     ).then(fn=set_text_finished, outputs=generated_information)
+
+
+    def create_json_example(prompts, control_images=None):
+        data = {}
+        for i, prompt in enumerate(prompts):
+            item = {"prompt": prompt}
+            if control_images and i < len(control_images):
+                with open(control_images[i], "rb") as image_file:
+                    encoded_string = base64.b64encode(image_file.read()).decode()
+                    item["control_image"] = encoded_string
+            data[str(i)] = item
+        return json.dumps(data, indent=2)
+
 
     gr.Examples(
         examples=[
@@ -1201,126 +1247,19 @@ with gr.Blocks(css=css) as demo:
                 2,
                 "[Bob] A man, wearing a black suit\n[Alice]a woman, wearing a white shirt",
                 "bad anatomy, bad hands, missing fingers, extra fingers, three hands, three legs, bad arms, missing legs, missing arms, poorly drawn face, bad face, fused face, cloned face, three crus, fused feet, fused thigh, extra crus, ugly fingers, horn, cartoon, cg, 3d, unreal, animate, amputation, disconnected limbs",
-                array2string(
-                    [
-                        "[Bob] at home, read new paper #at home, The newspaper says there is a treasure house in the forest.",
-                        "[Bob] on the road, near the forest",
-                        "[Alice] is make a call at home # [Bob] invited [Alice] to join him on an adventure.",
-                        "[NC]A tiger appeared in the forest, at night ",
-                        "[NC] The car on the road, near the forest #They drives to the forest in search of treasure.",
-                        "[Bob] very frightened, open mouth, in the forest, at night",
-                        "[Alice] very frightened, open mouth, in the forest, at night",
-                        "[Bob]  and [Alice] running very fast, in the forest, at night",
-                        "[NC] A house in the forest, at night #Suddenly, They discovers the treasure house!",
-                        "[Bob]  and [Alice]  in the house filled with  treasure, laughing, at night #He is overjoyed inside the house.",
-                    ]
-                ),
+                create_json_example([
+                    "[Bob] at home, read new paper",
+                    "[Bob] on the road, near the forest",
+                    "[Alice] is make a call at home",
+                    "[NC]A tiger appeared in the forest, at night",
+                    # ... other prompts ...
+                ], ["./examples/control/ref2.jpg", "./examples/control/control.jpg"]),
                 "Comic book",
                 "Only Using Textual Description",
                 get_image_path_list("./examples/taylor"),
                 768,
                 768,
-            ],
-            [
-                0,
-                0.5,
-                0.5,
-                2,
-                "[Bob] A man img, wearing a black suit\n[Alice]a woman img, wearing a white shirt",
-                "bad anatomy, bad hands, missing fingers, extra fingers, three hands, three legs, bad arms, missing legs, missing arms, poorly drawn face, bad face, fused face, cloned face, three crus, fused feet, fused thigh, extra crus, ugly fingers, horn, cartoon, cg, 3d, unreal, animate, amputation, disconnected limbs",
-                array2string(
-                    [
-                        "[Bob] at home, read new paper #at home, The newspaper says there is a treasure house in the forest.",
-                        "[Bob] on the road, near the forest",
-                        "[Alice] is make a call at home # [Bob] invited [Alice] to join him on an adventure.",
-                        "[NC] The car on the road, near the forest #They drives to the forest in search of treasure.",
-                        "[NC]A tiger appeared in the forest, at night ",
-                        "[Bob] very frightened, open mouth, in the forest, at night",
-                        "[Alice] very frightened, open mouth, in the forest, at night",
-                        "[Bob]  running very fast, in the forest, at night",
-                        "[NC] A house in the forest, at night #Suddenly, They discovers the treasure house!",
-                        "[Bob]  in the house filled with  treasure, laughing, at night #They are overjoyed inside the house.",
-                    ]
-                ),
-                "Comic book",
-                "Using Ref Images",
-                get_image_path_list("./examples/twoperson"),
-                1024,
-                1024,
-            ],
-            [
-                1,
-                0.5,
-                0.5,
-                3,
-                "[Taylor]a woman img, wearing a white T-shirt, blue loose hair",
-                "bad anatomy, bad hands, missing fingers, extra fingers, three hands, three legs, bad arms, missing legs, missing arms, poorly drawn face, bad face, fused face, cloned face, three crus, fused feet, fused thigh, extra crus, ugly fingers, horn, cartoon, cg, 3d, unreal, animate, amputation, disconnected limbs",
-                array2string(
-                    [
-                        "[Taylor]wake up in the bed",
-                        "[Taylor]have breakfast",
-                        "[Taylor]is on the road, go to company",
-                        "[Taylor]work in the company",
-                        "[Taylor]Take a walk next to the company at noon",
-                        "[Taylor]lying in bed at night",
-                    ]
-                ),
-                "Japanese Anime",
-                "Using Ref Images",
-                get_image_path_list("./examples/taylor"),
-                768,
-                768,
-            ],
-            [
-                0,
-                0.5,
-                0.5,
-                3,
-                "[Bob]a man, wearing black jacket",
-                "bad anatomy, bad hands, missing fingers, extra fingers, three hands, three legs, bad arms, missing legs, missing arms, poorly drawn face, bad face, fused face, cloned face, three crus, fused feet, fused thigh, extra crus, ugly fingers, horn, cartoon, cg, 3d, unreal, animate, amputation, disconnected limbs",
-                array2string(
-                    [
-                        "[Bob]wake up in the bed",
-                        "[Bob]have breakfast",
-                        "[Bob]is on the road, go to the company,  close look",
-                        "[Bob]work in the company",
-                        "[Bob]laughing happily",
-                        "[Bob]lying in bed at night",
-                    ]
-                ),
-                "Japanese Anime",
-                "Only Using Textual Description",
-                get_image_path_list("./examples/taylor"),
-                768,
-                768,
-            ],
-            [
-                0,
-                0.3,
-                0.5,
-                3,
-                "[Kitty]a girl, wearing white shirt, black skirt, black tie, yellow hair",
-                "bad anatomy, bad hands, missing fingers, extra fingers, three hands, three legs, bad arms, missing legs, missing arms, poorly drawn face, bad face, fused face, cloned face, three crus, fused feet, fused thigh, extra crus, ugly fingers, horn, cartoon, cg, 3d, unreal, animate, amputation, disconnected limbs",
-                array2string(
-                    [
-                        "[Kitty]at home #at home, began to go to drawing",
-                        "[Kitty]sitting alone on a park bench.",
-                        "[Kitty]reading a book on a park bench.",
-                        "[NC]A squirrel approaches, peeking over the bench. ",
-                        "[Kitty]look around in the park. # She looks around and enjoys the beauty of nature.",
-                        "[NC]leaf falls from the tree, landing on the sketchbook.",
-                        "[Kitty]picks up the leaf, examining its details closely.",
-                        "[NC]The brown squirrel appear.",
-                        "[Kitty]is very happy # She is very happy to see the squirrel again",
-                        "[NC]The brown squirrel takes the cracker and scampers up a tree. # She gives the squirrel cracker",
-                    ]
-                ),
-                "Japanese Anime",
-                "Only Using Textual Description",
-                get_image_path_list("./examples/taylor"),
-                768,
-                768,
-            ],
+            ]
         ],
         inputs=[
             seed_,
@@ -1329,7 +1268,7 @@ with gr.Blocks(css=css) as demo:
             id_length_,
             general_prompt,
             negative_prompt,
-            prompt_array,
+            prompt_json,
             style,
             model_type,
             files,

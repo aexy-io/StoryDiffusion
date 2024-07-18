@@ -478,38 +478,67 @@ def get_cur_id_list(real_prompt,character_dict,character_index_dict):
             real_prompt = real_prompt.replace(keys,character_dict[keys])
     return list_arr,real_prompt
 
-def process_original_prompt(character_dict,prompts,id_length):
+def process_original_prompt(character_dict, prompts, id_length):
     replace_prompts = []
     character_index_dict = {}
     invert_character_index_dict = {}
-    for ind,prompt in enumerate(prompts):
-                for key in character_dict.keys():
-                    if key in prompt:
-                        if key not in character_index_dict:
-                            character_index_dict[key] = []
-                        character_index_dict[key].append(ind)
-                        if ind not in invert_character_index_dict:
-                            invert_character_index_dict[ind] = []
-                        invert_character_index_dict[ind].append(key)
-                cur_prompt = prompt
-                if ind in invert_character_index_dict:
-                    for key in invert_character_index_dict[ind]:
-                        cur_prompt = cur_prompt.replace(key,character_dict[key] + " ")
-                replace_prompts.append(cur_prompt)
+    print("prompts")
+    print(prompts)
+    for ind, prompt in enumerate(prompts):
+        for key in character_dict.keys():
+            if key in prompt:
+                if key not in character_index_dict:
+                    character_index_dict[key] = []
+                character_index_dict[key].append(ind)
+                if ind not in invert_character_index_dict:
+                    invert_character_index_dict[ind] = []
+                invert_character_index_dict[ind].append(key)
+        cur_prompt = prompt
+        if ind in invert_character_index_dict:
+            for key in invert_character_index_dict[ind]:
+                cur_prompt = cur_prompt.replace(key, character_dict[key] + " ")
+        replace_prompts.append(cur_prompt)
     ref_index_dict = {}
     ref_totals = []
+    print("character_dict")
+    print(character_dict)
+    print("character_index_dict")
     print(character_index_dict)
-    for character_key in character_index_dict.keys():
+    print("ref_index_dict")
+    print(ref_index_dict)
+    for character_key in character_dict.keys():
         if character_key not in character_index_dict:
             raise gr.Error("{} not have prompt description, please remove it".format(character_key))
         index_list = character_index_dict[character_key]
         index_list = [index for index in index_list if len(invert_character_index_dict[index]) == 1]
-        if len(index_list) < id_length:
-            raise gr.Error(f"{character_key} not have enough prompt description, need no less than {id_length}, but you give {len(index_list)}")
-        ref_index_dict[character_key] = index_list[:id_length]
-        ref_totals = ref_totals + index_list[:id_length]
-    return character_index_dict,invert_character_index_dict,replace_prompts,ref_index_dict,ref_totals
+        print("index_list")
+        print(index_list)
+        print("id_length")
+        print(id_length)
 
+        # If there aren't enough prompts, duplicate the last one
+        while len(index_list) < id_length:
+            if index_list:
+                last_index = index_list[-1]
+                new_index = len(prompts)
+                prompts.append(prompts[last_index])
+                replace_prompts.append(replace_prompts[last_index])
+                character_index_dict[character_key].append(new_index)
+                invert_character_index_dict[new_index] = [character_key]
+                index_list.append(new_index)
+            else:
+                # If no prompts at all, create a default one
+                new_index = len(prompts)
+                default_prompt = f"{character_key} default pose"
+                prompts.append(default_prompt)
+                replace_prompts.append(default_prompt.replace(character_key, character_dict[character_key] + " "))
+                character_index_dict[character_key].append(new_index)
+                invert_character_index_dict[new_index] = [character_key]
+                index_list.append(new_index)
+
+        ref_index_dict[character_key] = index_list[:id_length]
+        ref_totals.extend(index_list[:id_length])
+    return character_index_dict, invert_character_index_dict, replace_prompts, ref_index_dict, ref_totals
 
 def get_ref_character(real_prompt,character_dict):
     list_arr = []
